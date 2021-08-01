@@ -1,2 +1,2 @@
 # ProxyFinder
-Casual Project
+Casual project
