@@ -26,6 +26,7 @@ static FAST_URL:&str = "http://dreenot.pythonanywhere.com/";
 static HTTPS_QUERY:&[u8;39] = b"CONNECT www.google.com:443 HTTP/1.0\r\n\r\n";
 static FAST_HTTPS_PROOF:&str = "200 Connection established";
 
+
 fn help(){
     println!("ProxyFinder version: {}\n",VERSION);
     println!("Usage:");
@@ -125,41 +126,48 @@ struct CheckResult{
 
 fn fast_check(addresses:Vec<String>,
                 timeout:u64,
-                outvector_mutex:&Arc<Mutex<Vec<CheckResult>>>){
+                outvector_mutex:&Arc<Mutex<Vec<CheckResult>>>,
+                PORTS:Vec<u16>){
                 
     let mut results:HashMap<String,CheckResult> = HashMap::new();
-    let mut retries:Vec<u16> = Vec::with_capacity(addresses.len());
+    let actual_addresses = unsafe{addresses.len()*PORTS.len()};
+    let mut retries:Vec<u16> = Vec::with_capacity(actual_addresses);
     
 
-    let mut sockets:Vec<TcpStream> = Vec::with_capacity(addresses.len());
+    let mut sockets:Vec<TcpStream> = Vec::with_capacity(actual_addresses);
 
-    let mut sockets_tokens:Vec<Token> = Vec::with_capacity(addresses.len());
-    for i in 0..addresses.len(){
+    let mut sockets_tokens:Vec<Token> = Vec::with_capacity(actual_addresses);
+    for i in 0..actual_addresses{
         sockets_tokens.push(Token(i));
         retries.push(0);
     }
 
     let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(addresses.len());
+    let mut events = Events::with_capacity(actual_addresses);
     
     let mut parsed_address:SocketAddr;
     for index in 0..addresses.len(){
-        parsed_address = addresses[index].parse().unwrap();
-        sockets.push(TcpStream::connect(parsed_address).unwrap());
-        poll.registry()
-                .register(&mut sockets[index],
-                            sockets_tokens[index],
-                            Interest::READABLE|Interest::WRITABLE).unwrap();   
+        unsafe{
+            for i in 0..PORTS.len(){
+                parsed_address = format!("{}:{}",
+                                            addresses[index],
+                                            PORTS[i]).parse().unwrap();
+                
+                sockets.push(TcpStream::connect(parsed_address).unwrap());
+                poll.registry()
+                        .register(&mut sockets[index+i],
+                                    sockets_tokens[index+i],
+                                    Interest::READABLE|Interest::WRITABLE).unwrap();
+            }   
+        };
     }
 
-    let mut servers_remain:usize = addresses.len();
+    let mut servers_remain:usize = actual_addresses;
     let timeout_duration:Option<Duration> = Some(Duration::new(timeout,0));
 
     let HTTP_QUERY = format!("GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\nDNT: 1\r\nConnection: keep-alive\r\n\r\n",
                                 FAST_URL,FAST_HOST);
     let HTTP_QUERY_BYTES = HTTP_QUERY.as_bytes();
-    
-    
     
     // check http protocol
     while servers_remain>0{
@@ -174,6 +182,10 @@ fn fast_check(addresses:Vec<String>,
                 
             }
         }
+        if events.is_empty(){
+            servers_remain = 0;
+            break;
+        }
         for event in events.iter(){
             let mut index:usize = usize::from(event.token());
             
@@ -184,9 +196,16 @@ fn fast_check(addresses:Vec<String>,
                 }
                 if http_is_valid(&mut buffer)
                     ||fast_is_valid(&mut buffer){
-                    results.insert(addresses[index].clone(),
-                                    CheckResult{address:addresses[index].clone(),
-                                             proxy_type:0});
+                    let addr = sockets[index].peer_addr();
+                    match addr{
+                        Err(e) =>{continue;}
+                        Ok(addr)=>{
+                            let addr_string = addr.to_string();
+                            results.insert(addr_string.clone(),
+                                            CheckResult{address:addr_string.clone(),
+                                                    proxy_type:0});
+                        }
+                    }
                 }
                 sockets[index].shutdown(Shutdown::Both);
                 poll.registry().deregister(&mut sockets[index]);
@@ -203,21 +222,27 @@ fn fast_check(addresses:Vec<String>,
     }
 
     // check https protocol
-    let mut sockets:Vec<TcpStream> = Vec::with_capacity(addresses.len());
+    let mut sockets:Vec<TcpStream> = Vec::with_capacity(actual_addresses);
 
     let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(addresses.len());
+    let mut events = Events::with_capacity(actual_addresses);
     
     let mut parsed_address:SocketAddr;
     for index in 0..addresses.len(){
-        parsed_address = addresses[index].parse().unwrap();
-        sockets.push(TcpStream::connect(parsed_address).unwrap());
-        poll.registry()
-                .register(&mut sockets[index],
-                            sockets_tokens[index],
-                            Interest::READABLE|Interest::WRITABLE).unwrap();   
+        unsafe{
+            for i in 0..PORTS.len(){
+                parsed_address = format!("{}:{}",
+                                            addresses[index],
+                                            PORTS[i]).parse().unwrap();
+                sockets.push(TcpStream::connect(parsed_address).unwrap());
+                poll.registry()
+                        .register(&mut sockets[index+i],
+                                    sockets_tokens[index+i],
+                                    Interest::READABLE|Interest::WRITABLE).unwrap();
+            }   
+        };
     }
-    let mut servers_remain:usize = addresses.len();
+    let mut servers_remain:usize = actual_addresses;
     
     let mut buffer:Vec<u8> = Vec::with_capacity(1024);
     while servers_remain>0{
@@ -231,6 +256,10 @@ fn fast_check(addresses:Vec<String>,
                 
             }
         }
+        if events.is_empty(){
+            servers_remain = 0;
+            break;
+        }
         for event in events.iter(){
             let mut index:usize = usize::from(event.token());
             
@@ -240,14 +269,24 @@ fn fast_check(addresses:Vec<String>,
                     _ => {}
                 }
                 if https_is_valid(&mut buffer){
-                    match results.get_mut(&addresses[index]){
-                        Some(re) => {re.proxy_type = 2}
-                        None => {
-                                results.insert(addresses[index].clone(),
-                                CheckResult{address:addresses[index].clone(),
-                                proxy_type:1});
-                                
+                    let addr = sockets[index].peer_addr();
+                    match addr{
+                        Err(e) =>{
+                            sockets[index].shutdown(Shutdown::Both);
+                            poll.registry().deregister(&mut sockets[index]);
+                            continue;}
+                        Ok(addr)=>{
+                            let addr_string = addr.to_string();
+                            match results.get_mut(&addr_string){
+                                Some(re) => {re.proxy_type = 2}
+                                None => {
+                                        results.insert(addr_string.clone(),
+                                        CheckResult{address:addr_string.clone(),
+                                        proxy_type:1});
+                                        
+                                    }
                             }
+                        }
                     }
                 }
                 sockets[index].shutdown(Shutdown::Both);
@@ -288,6 +327,7 @@ fn main() {
     let mut resulting_vector:Vec<CheckResult> = Vec::new();
     let mut retries:u16 = 3;
     let resulting_vector_mutex = Arc::new(Mutex::new(resulting_vector));
+    let mut PORTS:Vec<u16> = vec![80,8080,3128];
 
     let args: Vec<String> = env::args().collect();
     // parse console line parameters
@@ -454,9 +494,11 @@ fn main() {
         for i in 0..bunches.len(){
             let bunch = bunches[i].clone();
             let resulting_vector_mutex = Arc::clone(&resulting_vector_mutex);
+            let PORTS_copy = PORTS.clone();
             thread_pool.push(thread::spawn(move||fast_check(bunch, 
                                                             timeout, 
-                                                            &resulting_vector_mutex)));
+                                                            &resulting_vector_mutex,
+                                                            PORTS_copy)));
         }
 
         println!("[Info] Waiting for threads to stop");
