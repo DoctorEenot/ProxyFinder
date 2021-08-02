@@ -14,6 +14,9 @@ use std::time::Duration;
 use std::option;
 use std::str;
 use std::collections::HashMap;
+use std::time::SystemTime;
+use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc;
 
 //http://dreenot.pythonanywhere.com/
 static VERSION:&str = "1.0.0";
@@ -125,12 +128,14 @@ struct CheckResult{
 }
 
 fn fast_check(addresses:Vec<String>,
-                timeout:u64,
+                mut timeout:u64,
                 outvector_mutex:&Arc<Mutex<Vec<CheckResult>>>,
-                PORTS:Vec<u16>){
+                PORTS:Vec<u16>,
+                tx:Sender<u32>,
+                id:u32){
                 
     let mut results:HashMap<String,CheckResult> = HashMap::new();
-    let actual_addresses = unsafe{addresses.len()*PORTS.len()};
+    let mut actual_addresses = unsafe{addresses.len()*PORTS.len()};
     let mut retries:Vec<u16> = Vec::with_capacity(actual_addresses);
     
 
@@ -141,7 +146,7 @@ fn fast_check(addresses:Vec<String>,
         sockets_tokens.push(Token(i));
         retries.push(0);
     }
-
+    //println!("{:?}",addresses);
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(actual_addresses);
     
@@ -152,27 +157,35 @@ fn fast_check(addresses:Vec<String>,
                 parsed_address = format!("{}:{}",
                                             addresses[index],
                                             PORTS[i]).parse().unwrap();
-                
+                //println!("{:?}",parsed_address);
                 sockets.push(TcpStream::connect(parsed_address).unwrap());
-                poll.registry()
-                        .register(&mut sockets[index+i],
-                                    sockets_tokens[index+i],
-                                    Interest::READABLE|Interest::WRITABLE).unwrap();
+                let ret = poll.registry().register(&mut sockets[(index*PORTS.len())+i],sockets_tokens[(index*PORTS.len())+i],Interest::READABLE|Interest::WRITABLE);
+                match ret{
+                    Err(e) => {
+                        //println!("err {:?}",parsed_address);
+                        actual_addresses -= 1;}
+                    Ok(e) =>{}
+                }
             }   
         };
     }
 
     let mut servers_remain:usize = actual_addresses;
-    let timeout_duration:Option<Duration> = Some(Duration::new(timeout,0));
+    let mut timeout_duration:Option<Duration> = Some(Duration::new(timeout,0));
+
 
     let HTTP_QUERY = format!("GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\nDNT: 1\r\nConnection: keep-alive\r\n\r\n",
                                 FAST_URL,FAST_HOST);
     let HTTP_QUERY_BYTES = HTTP_QUERY.as_bytes();
-    
+    let mut buffer:Vec<u8> = Vec::with_capacity(1024);
+
     // check http protocol
-    while servers_remain>0{
-        let mut buffer:Vec<u8> = Vec::with_capacity(1024);
+    while true{
+        let started_polling = SystemTime::now();
         let res = poll.poll(&mut events,timeout_duration);
+        timeout = timeout-started_polling.elapsed().unwrap().as_secs();
+        timeout_duration = Some(Duration::new(timeout,0));
+        
         match res{
             Err(e) => {
                 servers_remain = 0;
@@ -194,9 +207,11 @@ fn fast_check(addresses:Vec<String>,
                 match result{
                     _ => {}
                 }
+                //println!("{}\n{:?}",index,buffer);
                 if http_is_valid(&mut buffer)
                     ||fast_is_valid(&mut buffer){
                     let addr = sockets[index].peer_addr();
+                    //println!("{:?}",addr);
                     match addr{
                         Err(e) =>{continue;}
                         Ok(addr)=>{
@@ -209,7 +224,7 @@ fn fast_check(addresses:Vec<String>,
                 }
                 sockets[index].shutdown(Shutdown::Both);
                 poll.registry().deregister(&mut sockets[index]);
-                servers_remain -= 1;
+                //servers_remain -= 1;
             }
 
             if event.is_writable(){
@@ -229,24 +244,31 @@ fn fast_check(addresses:Vec<String>,
     
     let mut parsed_address:SocketAddr;
     for index in 0..addresses.len(){
-        unsafe{
-            for i in 0..PORTS.len(){
-                parsed_address = format!("{}:{}",
-                                            addresses[index],
-                                            PORTS[i]).parse().unwrap();
-                sockets.push(TcpStream::connect(parsed_address).unwrap());
-                poll.registry()
-                        .register(&mut sockets[index+i],
-                                    sockets_tokens[index+i],
-                                    Interest::READABLE|Interest::WRITABLE).unwrap();
-            }   
-        };
+        
+        for i in 0..PORTS.len(){
+            parsed_address = format!("{}:{}",
+                                    addresses[index],
+                                    PORTS[i]).parse().unwrap();
+            sockets.push(TcpStream::connect(parsed_address).unwrap());
+            let ret = poll.registry().register(&mut sockets[(index*PORTS.len())+i],
+                                sockets_tokens[(index*PORTS.len())+i],
+                                Interest::READABLE|Interest::WRITABLE);
+            match ret{
+                Err(e) => {actual_addresses -= 1}
+                Ok(e) =>{}
+            }
+        }   
+        
     }
+    let mut timeout_duration:Option<Duration> = Some(Duration::new(timeout,0));
     let mut servers_remain:usize = actual_addresses;
     
     let mut buffer:Vec<u8> = Vec::with_capacity(1024);
-    while servers_remain>0{
+    while true{
+        let started_polling = SystemTime::now();
         let res = poll.poll(&mut events,timeout_duration);
+        timeout = timeout-started_polling.elapsed().unwrap().as_secs();
+        timeout_duration = Some(Duration::new(timeout,0));
         match res{
             Err(e) => {
                 servers_remain = 0;
@@ -291,7 +313,10 @@ fn fast_check(addresses:Vec<String>,
                 }
                 sockets[index].shutdown(Shutdown::Both);
                 poll.registry().deregister(&mut sockets[index]);
-                servers_remain -= 1;
+                // if servers_remain == 0{
+                //     break;
+                // }
+                // servers_remain -= 1;
                 
             }
 
@@ -311,11 +336,12 @@ fn fast_check(addresses:Vec<String>,
                                     proxy_type:result.proxy_type});
     }
     drop(outvector);
+    tx.send(id).unwrap();
 }
 
 fn main() {
 
-    let mut amount_of_threads:u32 = 1;
+    let mut amount_of_threads:u16 = 1;
     let mut output_into_file:bool = false;
     let mut input_from_file:bool = false;
     let mut output_filename:String = String::from("");
@@ -327,6 +353,7 @@ fn main() {
     let mut resulting_vector:Vec<CheckResult> = Vec::new();
     let mut retries:u16 = 3;
     let resulting_vector_mutex = Arc::new(Mutex::new(resulting_vector));
+    let mut ips_per_thread:u16 = 50;
     let mut PORTS:Vec<u16> = vec![80,8080,3128];
 
     let args: Vec<String> = env::args().collect();
@@ -344,7 +371,7 @@ fn main() {
                     help();
                     panic!("-t/--threads requires specified number after");
                 }
-                amount_of_threads = args[argument_counter+1].parse::<u32>().unwrap();
+                amount_of_threads = args[argument_counter+1].parse::<u16>().unwrap();
                 argument_counter += 2;
             }
             "-o"|"--output"=>{
@@ -401,6 +428,7 @@ fn main() {
         }
     }
 
+
     if input_from_file{
         let f = File::open(input_filename).unwrap();
         let mut reader = BufReader::new(f);
@@ -411,17 +439,44 @@ fn main() {
     }
 
     if ip_addresses.len() == 0{
-        println!("[Error] No target were specified");
+        println!("[Error] No targets were specified");
         return;
     }
     println!("[Info] {} targets in total",ip_addresses.len());
+    if amount_of_threads > 2000{
+        println!("[Info] {} is too much threads",amount_of_threads);
+    }
+    
+    // preprocessing bunches for threads
+    println!("[Info] Splitting bunches for threads");
+    
+    let mut bunches:Vec<Vec<String>> = Vec::with_capacity(ip_addresses.len()/ips_per_thread as usize);
+    let mut ips_counter = 0;
+    let mut bunches_counter = 0;
+    while ips_counter<ip_addresses.len(){
+        
+        let mut stop = ips_counter+ips_per_thread as usize;
+        if stop > ip_addresses.len(){
+            stop = ip_addresses.len();
+        }
+        bunches.push(Vec::with_capacity(ips_per_thread as usize));
 
-    if amount_of_threads as usize>ip_addresses.len(){
-        println!("[Info] Too many threads for {} addresses, amount of threads will be truncated",ip_addresses.len());
-        amount_of_threads = ip_addresses.len() as u32;
+        for i in ips_counter..stop{
+            bunches[bunches_counter].push(ip_addresses[i].clone());
+        }
+
+        bunches_counter += 1;
+        ips_counter = stop;
+    }
+
+    println!("[Info] {} bunches in total with {} ips per bunch",bunches.len(),ips_per_thread);
+    if amount_of_threads as usize>bunches.len(){
+        println!("[Info] Too big amount of threads, will be truncated to {} threads",bunches.len());
+        amount_of_threads = bunches.len() as u16;
     }
 
     if use_fast_search{
+        println!("[Info] Using fast search");
         let mut buffer:Vec<u8> = Vec::new();
         // check fast verifyier availability
         let mut res = dns_lookup::look_up(String::from(FAST_DOMAIN),
@@ -460,55 +515,51 @@ fn main() {
         }else{
             println!("[Info] Fast search validated");
         }
-        
-        // preprocessing bunches of servers
-        let mut bunches:Vec<Vec<String>> = Vec::with_capacity(amount_of_threads as usize);
-        let mut ips_per_thread:usize = ip_addresses.len()/(amount_of_threads as usize);
-        if (amount_of_threads as usize)%ip_addresses.len() != 0{
-            ips_per_thread += 1;
-        }
-        println!("[Info] Splitting bunches for threads");
-        let mut ips_counter:usize = 0;
-        for i in 0..amount_of_threads{
-            let mut add_vec:Vec<String> = Vec::with_capacity(ips_per_thread);
-            if ips_per_thread+ips_counter > ip_addresses.len(){
-                ips_per_thread = ip_addresses.len() - ips_counter;
-
-                for i in 0..ips_per_thread{
-                    add_vec.push(ip_addresses[ips_counter+i].clone());
-                }
-                ips_counter += ips_per_thread;
-                bunches.push(add_vec);
-                break;
-            }
-            for i in 0..ips_per_thread{
-                add_vec.push(ip_addresses[ips_counter+i].clone());
-            }
-            ips_counter += ips_per_thread;
-            bunches.push(add_vec);
-        }
-        println!("[Info] {} threads will be launched",bunches.len());
 
         // launching threads
+        let (tx, rx): (Sender<u32>, Receiver<u32>) = mpsc::channel();
+        println!("[Info] Launching {} threads",amount_of_threads);
         let mut thread_pool = vec![];
-        for i in 0..bunches.len(){
-            let bunch = bunches[i].clone();
+        // launching initial threads
+        for i in 0..amount_of_threads{
+            let bunch = bunches[i as usize].clone();
             let resulting_vector_mutex = Arc::clone(&resulting_vector_mutex);
             let PORTS_copy = PORTS.clone();
+            let tx_clone = tx.clone();
             thread_pool.push(thread::spawn(move||fast_check(bunch, 
-                                                            timeout, 
-                                                            &resulting_vector_mutex,
-                                                            PORTS_copy)));
-        }
+                                timeout, 
+                                &resulting_vector_mutex,
+                                PORTS_copy,
+                                tx_clone,
+                                i as u32)));
 
-        println!("[Info] Waiting for threads to stop");
-        let mut stopped_threads = 1;
+        }
+        let mut bunch_counter = amount_of_threads;
+        while bunch_counter<bunches.len() as u16{
+            let thread_id = rx.recv().unwrap();
+            println!("[Info] {} thread ended, sending {}/{} bunch",
+                            thread_id,bunch_counter,bunches.len());
+            //let handle = &thread_pool[thread_id as usize];
+            //handle.join().unwrap();
+            //thread_pool[thread_id as usize].join();
+
+            let bunch = bunches[bunch_counter as usize].clone();
+            let resulting_vector_mutex = Arc::clone(&resulting_vector_mutex);
+            let PORTS_copy = PORTS.clone();
+            let tx_clone = tx.clone();
+            thread_pool[thread_id as usize] = thread::spawn(move||fast_check(bunch, 
+                                            timeout, 
+                                            &resulting_vector_mutex,
+                                            PORTS_copy,
+                                            tx_clone,
+                                            thread_id));
+            bunch_counter += 1;
+        }
+        println!("[Info] Last bunch was sent, waiting for threads to stop");
         for thread in thread_pool{
             thread.join().unwrap();
-            println!("[Info] {}/{} threads stoppped",
-                        stopped_threads,bunches.len());
-            stopped_threads += 1;
         }
+
         println!("[Info] All threads stopped");
         //println!("{:?}",*resulting_vector_mutex.lock().unwrap())
     }
